@@ -1,5 +1,5 @@
 ﻿import 'dart:async';
-import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -14,7 +14,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  if (Platform.isAndroid || Platform.isIOS) {
+  if (!kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS)) {
     await MobileAds.instance.initialize();
   }
   final prefs = await SharedPreferences.getInstance();
@@ -213,28 +213,37 @@ class OnboardingScreen extends StatefulWidget {
 }
 
 class _OnboardingScreenState extends State<OnboardingScreen> {
-  final InAppPurchase _iap = InAppPurchase.instance;
   StreamSubscription<List<PurchaseDetails>>? _subscription;
   bool _isProcessingPurchase = false;
+
+  bool get _isMobileStoreSupported =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS);
 
   @override
   void initState() {
     super.initState();
-    final Stream<List<PurchaseDetails>> purchaseUpdated = _iap.purchaseStream;
-    _subscription = purchaseUpdated.listen(
-      (purchaseDetailsList) {
-        for (final purchaseDetails in purchaseDetailsList) {
-          if (purchaseDetails.status == PurchaseStatus.purchased ||
-              purchaseDetails.status == PurchaseStatus.restored) {
-            widget.onPlanSelected('premium');
-          }
-          if (purchaseDetails.pendingCompletePurchase) {
-            _iap.completePurchase(purchaseDetails);
-          }
-        }
-      },
-      onError: (_) {},
-    );
+    if (_isMobileStoreSupported) {
+      try {
+        final Stream<List<PurchaseDetails>> purchaseUpdated =
+            InAppPurchase.instance.purchaseStream;
+        _subscription = purchaseUpdated.listen(
+          (purchaseDetailsList) {
+            for (final purchaseDetails in purchaseDetailsList) {
+              if (purchaseDetails.status == PurchaseStatus.purchased ||
+                  purchaseDetails.status == PurchaseStatus.restored) {
+                widget.onPlanSelected('premium');
+              }
+              if (purchaseDetails.pendingCompletePurchase) {
+                InAppPurchase.instance.completePurchase(purchaseDetails);
+              }
+            }
+          },
+          onError: (_) {},
+        );
+      } catch (_) {}
+    }
   }
 
   @override
@@ -245,22 +254,25 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
   Future<void> _handlePremiumPurchase() async {
     setState(() => _isProcessingPurchase = true);
-    try {
-      final bool available = await _iap.isAvailable();
-      if (available) {
-        const Set<String> kIds = <String>{'premium_unlimited_plan'};
-        final ProductDetailsResponse response =
-            await _iap.queryProductDetails(kIds);
-        if (response.productDetails.isNotEmpty) {
-          final PurchaseParam purchaseParam =
-              PurchaseParam(productDetails: response.productDetails.first);
-          await _iap.buyNonConsumable(purchaseParam: purchaseParam);
-          setState(() => _isProcessingPurchase = false);
-          return;
+    if (_isMobileStoreSupported) {
+      try {
+        final InAppPurchase iap = InAppPurchase.instance;
+        final bool available = await iap.isAvailable();
+        if (available) {
+          const Set<String> kIds = <String>{'premium_unlimited_plan'};
+          final ProductDetailsResponse response =
+              await iap.queryProductDetails(kIds);
+          if (response.productDetails.isNotEmpty) {
+            final PurchaseParam purchaseParam =
+                PurchaseParam(productDetails: response.productDetails.first);
+            await iap.buyNonConsumable(purchaseParam: purchaseParam);
+            setState(() => _isProcessingPurchase = false);
+            return;
+          }
         }
+      } catch (_) {
+        // Mağaza yapılandırılmamışsa veya emülatördeyse simülasyon akışına geç
       }
-    } catch (_) {
-      // Mağaza yapılandırılmamışsa veya emülatördeyse simülasyon akışına geç
     }
     setState(() => _isProcessingPurchase = false);
     widget.onPlanSelected('premium');
@@ -412,7 +424,7 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   }
 
   Future<void> _initEngines() async {
-    if (Platform.isAndroid || Platform.isIOS) {
+    if (!kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS)) {
       await Permission.microphone.request();
     }
 
@@ -428,9 +440,9 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   }
 
   void _loadBannerAd() {
-    if (!Platform.isAndroid && !Platform.isIOS) return;
+    if (kIsWeb || (defaultTargetPlatform != TargetPlatform.android && defaultTargetPlatform != TargetPlatform.iOS)) return;
     _bannerAd = BannerAd(
-      adUnitId: Platform.isAndroid
+      adUnitId: (!kIsWeb && defaultTargetPlatform == TargetPlatform.android)
           ? 'ca-app-pub-3940256099942544/6300978111'
           : 'ca-app-pub-3940256099942544/2934735716',
       size: AdSize.banner,
@@ -1004,4 +1016,6 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
     );
   }
 }
+
+
 
