@@ -1,5 +1,4 @@
-﻿import 'dart:async';
-import 'package:flutter/foundation.dart';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -11,11 +10,18 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'platform_destegi.dart';
+import 'linux_ses_okuyucu.dart';
+import 'google_ses_tanima.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  if (!kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS)) {
-    await MobileAds.instance.initialize();
+  if (PlatformDestegi.reklamDestekli) {
+    try {
+      await MobileAds.instance.initialize();
+    } catch (e) {
+      debugPrint('AdMob başlatılamadı: $e');
+    }
   }
   final prefs = await SharedPreferences.getInstance();
   final String? kullaniciTipi = prefs.getString('kullanici_tipi');
@@ -216,10 +222,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   StreamSubscription<List<PurchaseDetails>>? _subscription;
   bool _isProcessingPurchase = false;
 
-  bool get _isMobileStoreSupported =>
-      !kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.android ||
-          defaultTargetPlatform == TargetPlatform.iOS);
+  bool get _isMobileStoreSupported => PlatformDestegi.magazaDestekli;
 
   @override
   void initState() {
@@ -395,6 +398,15 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   bool _speechInitialized = false;
   bool _retryScheduled = false;
 
+  // Google STT yedeği (Linux'ta birincil, Windows'ta yerel motor arızasında)
+  bool _googleYedekModu = false;
+  bool _googleZorla = false; // kullanıcı ayarı (kalıcı)
+  static const String _googleZorlaAnahtari = 'google_stt_zorla';
+  int _ardisikHata = 0;
+  static const int _yedekHataEsigi = 3;
+  bool get _googleKullan =>
+      PlatformDestegi.isLinux || _googleYedekModu || _googleZorla;
+
   // Odak ve Kanal
   final FocusNode _keyboardFocusNode = FocusNode();
   static const MethodChannel _saatChannel =
@@ -418,31 +430,145 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   void dispose() {
     _keyboardFocusNode.dispose();
     _bannerAd?.dispose();
-    _speechToText.stop();
-    _flutterTts.stop();
+    _sttDurdur();
+    _ttsDurdur();
     super.dispose();
   }
 
+  /// Platform desteklemiyorsa sessizce geçen güvenli durdurma çağrıları
+  Future<void> _ttsDurdur() async {
+    if (PlatformDestegi.isLinux) {
+      await LinuxSesOkuyucu.durdur();
+      return;
+    }
+    if (!PlatformDestegi.sesliOkumaDestekli) return;
+    try {
+      await _flutterTts.stop();
+    } catch (_) {}
+  }
+
+  Future<void> _sttDurdur() async {
+    if (_googleKullan) {
+      await GoogleSesTanima.durdur();
+      if (PlatformDestegi.isLinux) return;
+    }
+    if (!PlatformDestegi.sesTanimaDestekli) return;
+    try {
+      await _speechToText.stop();
+    } catch (_) {}
+  }
+
+  Future<bool> _sttBaslat() async {
+    if (_googleKullan) {
+      return GoogleSesTanima.kullanilabilirMi();
+    }
+    if (!PlatformDestegi.sesTanimaDestekli) return false;
+    bool basarili = false;
+    try {
+      basarili = await _speechToText.initialize(
+        onStatus: _onSpeechStatus,
+        onError: _onSpeechError,
+      );
+    } catch (e) {
+      debugPrint('Ses tanıma başlatılamadı: $e');
+    }
+    if (!basarili && PlatformDestegi.googleYedekKullanilabilir) {
+      _googleYedegeGec('Windows ses tanıma başlatılamadı');
+      return GoogleSesTanima.kullanilabilirMi();
+    }
+    return basarili;
+  }
+
+  /// Windows yerel motorundan Google Cloud STT'ye geçer.
+  void _googleYedegeGec(String sebep) {
+    if (_googleYedekModu) return;
+    debugPrint('Google STT yedeğine geçiliyor: $sebep');
+    _googleYedekModu = true;
+    _ardisikHata = 0;
+    try {
+      _speechToText.cancel();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {});
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(
+        content: Text('$sebep → Google ses tanıma yedeğine geçildi'),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
+  /// Ayarlardan "Google ses tanımayı zorla" anahtarını değiştirir.
+  Future<void> _googleZorlaDegistir() async {
+    HapticFeedback.mediumImpact();
+    final bool yeniDeger = !_googleZorla;
+    await _stopConversation();
+    try {
+      _speechToText.cancel();
+    } catch (_) {}
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_googleZorlaAnahtari, yeniDeger);
+
+    setState(() {
+      _googleZorla = yeniDeger;
+      if (!yeniDeger) _googleYedekModu = false; // yerel motoru tekrar dene
+      _ardisikHata = 0;
+    });
+    _speechInitialized = await _sttBaslat();
+
+    if (!mounted) return;
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(
+        content: Text(yeniDeger
+            ? 'Google ses tanıma zorunlu olarak kullanılacak'
+            : 'Windows yerel ses tanıması kullanılacak (Google yedekte)'),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   Future<void> _initEngines() async {
-    if (!kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS)) {
-      await Permission.microphone.request();
+    if (PlatformDestegi.googleYedekKullanilabilir) {
+      final prefs = await SharedPreferences.getInstance();
+      _googleZorla = prefs.getBool(_googleZorlaAnahtari) ?? false;
+    }
+    if (PlatformDestegi.izinYoneticisiDestekli) {
+      try {
+        await Permission.microphone.request();
+        if (PlatformDestegi.isIOS) {
+          await Permission.speech.request();
+        }
+      } catch (e) {
+        debugPrint('İzin isteği başarısız: $e');
+      }
     }
 
-    await _flutterTts.awaitSpeakCompletion(true);
+    if (PlatformDestegi.sesliOkumaDestekli) {
+      try {
+        await _flutterTts.awaitSpeakCompletion(true);
+      } catch (e) {
+        debugPrint('TTS başlatılamadı: $e');
+      }
+    }
 
-    _speechInitialized = await _speechToText.initialize(
-      onStatus: _onSpeechStatus,
-      onError: _onSpeechError,
-    );
+    _speechInitialized = await _sttBaslat();
     if (mounted) {
-      setState(() {});
+      setState(() {
+        if (!PlatformDestegi.sesTanimaDestekli) {
+          _durumMetni =
+              '${PlatformDestegi.platformAdi} üzerinde sesli çeviri desteklenmiyor';
+        }
+      });
     }
   }
 
   void _loadBannerAd() {
-    if (kIsWeb || (defaultTargetPlatform != TargetPlatform.android && defaultTargetPlatform != TargetPlatform.iOS)) return;
+    if (!PlatformDestegi.reklamDestekli) return;
     _bannerAd = BannerAd(
-      adUnitId: (!kIsWeb && defaultTargetPlatform == TargetPlatform.android)
+      adUnitId: PlatformDestegi.isAndroid
           ? 'ca-app-pub-3940256099942544/6300978111'
           : 'ca-app-pub-3940256099942544/2934735716',
       size: AdSize.banner,
@@ -461,6 +587,7 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   }
 
   void _setupWearOsChannel() {
+    if (!PlatformDestegi.saatKanaliDestekli) return;
     _saatChannel.setMethodCallHandler((MethodCall call) async {
       final String message =
           call.arguments is String ? call.arguments as String : call.method;
@@ -521,8 +648,8 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   }
 
   Future<void> _startPerson1() async {
-    await _flutterTts.stop();
-    await _speechToText.stop();
+    await _ttsDurdur();
+    await _sttDurdur();
     setState(() {
       isConversationActive = true;
       isPerson1Turn = true;
@@ -533,8 +660,8 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   }
 
   Future<void> _startPerson2() async {
-    await _flutterTts.stop();
-    await _speechToText.stop();
+    await _ttsDurdur();
+    await _sttDurdur();
     setState(() {
       isConversationActive = true;
       isPerson1Turn = false;
@@ -553,29 +680,34 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
       _dinlenenMetin = '';
       _cevrilenMetin = '';
     });
-    await _speechToText.stop();
-    await _flutterTts.stop();
+    await _sttDurdur();
+    await _ttsDurdur();
   }
 
   Future<void> _startListening() async {
     if (!isConversationActive || isSpeaking) return;
 
-    if (!_speechInitialized) {
-      _speechInitialized = await _speechToText.initialize(
-        onStatus: _onSpeechStatus,
-        onError: _onSpeechError,
-      );
-    }
-
-    if (!_speechInitialized) {
+    if (!PlatformDestegi.sesTanimaDestekli) {
       setState(() {
-        _durumMetni = 'Mikrofon başlatılamadı (İzinleri kontrol edin)';
+        isConversationActive = false;
+        _durumMetni = PlatformDestegi.isLinux
+            ? 'Google STT API anahtarı tanımlı değil (GOOGLE_STT_API_KEY)'
+            : '${PlatformDestegi.platformAdi} üzerinde ses tanıma desteklenmiyor';
       });
       return;
     }
 
-    if (_speechToText.isListening) {
-      await _speechToText.stop();
+    if (!_speechInitialized) {
+      _speechInitialized = await _sttBaslat();
+    }
+
+    if (!_speechInitialized) {
+      setState(() {
+        _durumMetni = PlatformDestegi.isLinux
+            ? 'Kayıt aracı bulunamadı (sudo apt install sox)'
+            : 'Mikrofon başlatılamadı (İzinleri kontrol edin)';
+      });
+      return;
     }
 
     final String activeLocale = isPerson1Turn ? _person1Lang : _person2Lang;
@@ -586,16 +718,61 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
       _durumMetni = '$activePersonLabel Dinleniyor...';
     });
 
-    await _speechToText.listen(
-      listenOptions: stt.SpeechListenOptions(
-        localeId: activeLocale,
-        listenFor: const Duration(seconds: 60),
-        pauseFor: const Duration(seconds: 4),
-        partialResults: true,
-        cancelOnError: false,
-      ),
-      onResult: _onSpeechResult,
-    );
+    if (_googleKullan) {
+      await _googleDinle(activeLocale);
+      return;
+    }
+
+    if (_speechToText.isListening) {
+      await _speechToText.stop();
+    }
+
+    try {
+      await _speechToText.listen(
+        listenOptions: stt.SpeechListenOptions(
+          localeId: activeLocale,
+          listenFor: const Duration(seconds: 60),
+          pauseFor: const Duration(seconds: 4),
+          partialResults: true,
+          cancelOnError: false,
+        ),
+        onResult: _onSpeechResult,
+      );
+    } catch (e) {
+      debugPrint('Yerel dinleme hatası: $e');
+      if (PlatformDestegi.googleYedekKullanilabilir) {
+        _googleYedegeGec('Windows ses tanıma hata verdi');
+        await _googleDinle(activeLocale);
+      }
+    }
+  }
+
+  /// Google Cloud STT: kaydet → tanı → çevir ve oku (otonom ping-pong)
+  Future<void> _googleDinle(String locale) async {
+    String metin = '';
+    try {
+      metin = await GoogleSesTanima.dinleVeTani(locale);
+    } catch (e) {
+      debugPrint('Google STT hatası: $e');
+      if (mounted && isConversationActive) {
+        setState(() => _durumMetni = 'Ses tanıma hatası, tekrar deneniyor...');
+      }
+      await Future.delayed(const Duration(seconds: 2));
+    }
+
+    if (!mounted || !isConversationActive || isSpeaking) return;
+
+    if (metin.isEmpty) {
+      hasFinalResult = false;
+      _scheduleSilentRestart();
+      return;
+    }
+
+    setState(() {
+      _dinlenenMetin = metin;
+      hasFinalResult = true;
+    });
+    await _translateAndSpeak(metin);
   }
 
   Future<void> _onSpeechResult(SpeechRecognitionResult result) async {
@@ -614,6 +791,7 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
       }
 
       hasFinalResult = true;
+      _ardisikHata = 0;
       await _speechToText.stop();
       await _translateAndSpeak(spokenText);
     }
@@ -652,10 +830,22 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
       _durumMetni = '$targetPersonLabel Okunuyor...';
     });
 
-    await _flutterTts.setLanguage(toLangFull);
-    await _flutterTts.setSpeechRate(0.5);
-    await _flutterTts.setPitch(1.0);
-    await _flutterTts.speak(translatedText);
+    if (PlatformDestegi.isLinux) {
+      try {
+        await LinuxSesOkuyucu.konus(translatedText, toShort);
+      } catch (e) {
+        debugPrint('Linux sesli okuma hatası: $e');
+      }
+    } else if (PlatformDestegi.sesliOkumaDestekli) {
+      try {
+        await _flutterTts.setLanguage(toLangFull);
+        await _flutterTts.setSpeechRate(0.5);
+        await _flutterTts.setPitch(1.0);
+        await _flutterTts.speak(translatedText);
+      } catch (e) {
+        debugPrint('Sesli okuma hatası: $e');
+      }
+    }
 
     if (!mounted) return;
     setState(() {
@@ -672,7 +862,7 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   }
 
   void _onSpeechStatus(String status) {
-    if (!isConversationActive || isSpeaking) return;
+    if (!isConversationActive || isSpeaking || _googleKullan) return;
 
     if ((status == 'done' || status == 'notListening') && !hasFinalResult) {
       _scheduleSilentRestart();
@@ -680,7 +870,17 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
   }
 
   void _onSpeechError(SpeechRecognitionError error) {
-    if (!isConversationActive || isSpeaking) return;
+    if (!isConversationActive || isSpeaking || _googleKullan) return;
+
+    // Sessizlik kaynaklı hatalar normaldir, arıza sayılmaz
+    const sessizlikHatalari = {'error_no_match', 'error_speech_timeout'};
+    if (PlatformDestegi.googleYedekKullanilabilir &&
+        !sessizlikHatalari.contains(error.errorMsg)) {
+      _ardisikHata++;
+      if (_ardisikHata >= _yedekHataEsigi) {
+        _googleYedegeGec('Windows ses tanıma art arda hata verdi');
+      }
+    }
 
     if (!hasFinalResult) {
       _scheduleSilentRestart();
@@ -721,6 +921,17 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
           ),
           centerTitle: true,
           actions: [
+            if (PlatformDestegi.googleYedekKullanilabilir)
+              Tooltip(
+                message: _googleKullan
+                    ? 'Google ses tanıma aktif (değiştirmek için tıkla)'
+                    : 'Windows ses tanıma aktif (Google\'ı zorlamak için tıkla)',
+                child: _GoogleZorlaDugmesi(
+                  aktif: _googleZorla,
+                  yedekAktif: _googleYedekModu && !_googleZorla,
+                  onTap: _googleZorlaDegistir,
+                ),
+              ),
             Padding(
               padding: const EdgeInsets.only(right: 12.0),
               child: Chip(
@@ -1012,6 +1223,100 @@ class _AnaCeviriEkraniState extends State<AnaCeviriEkrani> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// AppBar'daki "Google ses tanımayı zorla" anahtarı.
+/// Basınca küçülür, durum değişince renk ve ikon animasyonla geçer.
+class _GoogleZorlaDugmesi extends StatefulWidget {
+  final bool aktif; // kullanıcı zorladı
+  final bool yedekAktif; // otomatik yedeğe geçildi
+  final VoidCallback onTap;
+
+  const _GoogleZorlaDugmesi({
+    required this.aktif,
+    required this.yedekAktif,
+    required this.onTap,
+  });
+
+  @override
+  State<_GoogleZorlaDugmesi> createState() => _GoogleZorlaDugmesiState();
+}
+
+class _GoogleZorlaDugmesiState extends State<_GoogleZorlaDugmesi> {
+  bool _basili = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color renk = widget.aktif
+        ? const Color(0xFF22C55E)
+        : widget.yedekAktif
+            ? const Color(0xFFF59E0B)
+            : const Color(0xFF64748B);
+    final String etiket = widget.aktif
+        ? 'GOOGLE'
+        : widget.yedekAktif
+            ? 'YEDEK'
+            : 'YEREL';
+
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _basili = true),
+      onTapUp: (_) {
+        setState(() => _basili = false);
+        widget.onTap();
+      },
+      onTapCancel: () => setState(() => _basili = false),
+      child: AnimatedScale(
+        scale: _basili ? 0.88 : 1.0,
+        duration: const Duration(milliseconds: 110),
+        curve: Curves.easeOut,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 250),
+          margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          decoration: BoxDecoration(
+            color: renk.withValues(alpha: _basili ? 0.35 : 0.2),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: renk, width: 1.4),
+            boxShadow: _basili
+                ? []
+                : [
+                    BoxShadow(
+                      color: renk.withValues(alpha: 0.35),
+                      blurRadius: 8,
+                      offset: const Offset(0, 3),
+                    ),
+                  ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 250),
+                transitionBuilder: (child, anim) =>
+                    RotationTransition(turns: anim, child: child),
+                child: Icon(
+                  widget.aktif ? Icons.cloud_done_rounded : Icons.mic_rounded,
+                  key: ValueKey(etiket),
+                  color: renk,
+                  size: 18,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                etiket,
+                style: TextStyle(
+                  color: renk,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.6,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
